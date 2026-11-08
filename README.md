@@ -8,7 +8,7 @@ The idea is simple. Schedulers shouldn't have to open P6 to answer "what's on th
 
 ```
 parser/
-  xer_to_json.py     reads a P6 export and writes structured JSON to stdout
+  xer_to_json.py     reads a P6 export and writes structured JSON to p6_analysis.json
 agent/
   instructions.md    system prompt for the "P6 Schedule Analyst" Copilot agent
 ```
@@ -18,10 +18,12 @@ agent/
 Needs Python 3.9+ and nothing outside the standard library.
 
 ```bash
-python parser/xer_to_json.py path/to/schedule.xer > schedule.json
+python parser/xer_to_json.py path/to/schedule.xer
 ```
 
-Output looks like this (trimmed):
+It prints a one-line summary (activity count and project name) and writes the full result to `p6_analysis.json` in whatever directory you ran it from. That filename is fixed for now, so a second run overwrites the first. You can also import it and call `parse_xer_file(path)` directly, which returns the same structure as a dict.
+
+Each activity gets its WBS name looked up from the export's `WBS` elements (it falls back to `"Unknown"` when there's no match). Activities without an ID are dropped. The JSON looks like this (trimmed):
 
 ```json
 {
@@ -29,13 +31,18 @@ Output looks like this (trimmed):
   "activities": [
     {
       "ID": "A1000",
+      "Code": "...",
       "Name": "Energise HV switchgear",
+      "WBS": "Electrical fit-out",
       "Status": "NOT_STARTED",
       "PctComplete": 0.0,
       "Duration": 10.0,
       "EarlyStart": "2024-01-01",
       "EarlyFinish": "2024-01-11",
+      "LateStart": "...",
+      "LateFinish": "...",
       "TotalFloat": 0.0,
+      "FreeFloat": 0.0,
       "IsCritical": true,
       "BaselineFinish": "...",
       "P20Finish": "...",
@@ -44,11 +51,17 @@ Output looks like this (trimmed):
       "Predecessors": [ { "ID": "A0990", "Type": "FS", "Lag": 0.0 } ]
     }
   ],
-  "metadata": { "parsed_at": "2026-11-08T10:00:00", "activity_count": 1 }
+  "metadata": {
+    "parsed_at": "2026-11-08T10:00:00",
+    "activity_count": 1,
+    "source_file": "schedule.xer"
+  }
 }
 ```
 
-If anything goes wrong the script prints `{"error": "..."}` and exits normally, so check for that key before passing the output on.
+If the file is missing or can't be parsed, the script prints `Error: ...`, writes nothing and still exits with code 0. Anything scripting around it should check for the output file (or the `error` key when calling the function) rather than rely on the exit code.
+
+Only the first `PROJECT` in the export is read, and nested elements such as `ACTIVITY`, `WBS` and `CALENDAR` are left out of the `project` block.
 
 ## Setting up the agent
 
@@ -60,8 +73,8 @@ The P20/P50/P80 fields are there for risk-adjusted finish dates from a Monte Car
 
 Worth reading before relying on any of this.
 
-- **It doesn't read native .xer files yet.** Despite the name, `xer_to_json.py` parses XML. A real XER file is tab-delimited text (`%T` table, `%F` fields, `%R` rows), so feeding one in will return a parse error. It also isn't quite P6's PMXML format, which uses tags like `Activity`, `Id` and `Name` rather than `ACTIVITY`, `ACTIVITY_ID` and `ACTIVITY_NAME`. Right now it only works on XML matching its own tag names. A proper XER reader would pull from the `PROJECT`, `TASK`, `TASKPRED` and `CALENDAR` tables.
-- Durations and float are passed through as-is. XER stores these in hours, so they'll need converting to days against the activity calendar.
+- **It doesn't read native .xer files yet.** Despite the name, and despite the docstring and comments in the latest version saying otherwise, `xer_to_json.py` parses XML. A real XER file is tab-delimited text (`%T` table, `%F` fields, `%R` rows), so feeding one in will return a parse error. It also isn't quite P6's PMXML format, which uses tags like `Activity`, `Id` and `Name` rather than `ACTIVITY`, `ACTIVITY_ID` and `ACTIVITY_NAME`. Right now it only works on XML matching its own tag names. A proper XER reader would pull from the `PROJECT`, `TASK`, `TASKPRED` and `CALENDAR` tables.
+- Durations, total float and free float are passed through as-is. XER stores these in hours, so they'll need converting to days against the activity calendar.
 - `agent/instructions.md` stops partway through the input schema. It still needs the actual analysis tasks (critical path summary, float erosion, baseline slippage, logic checks such as open ends and negative lag) and some guidance on output format.
 - No tests or sample data yet. Sample XER files are git-ignored on purpose so live project schedules don't end up in the repo; anonymised fixtures can go under `tests/fixtures/`.
 
