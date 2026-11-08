@@ -1,332 +1,326 @@
-import csv
-import io
+"""
+Convert an Oracle Primavera P6 .xer export into JSON for the Copilot agent.
+
+XER format, briefly
+-------------------
+An XER file is tab-delimited text. Each line starts with a marker:
+
+    ERMHDR  header line (P6 version, export date, user, currency ...)
+    %T      start of a table, e.g. "%T<tab>TASK"
+    %F      field names for that table
+    %R      one data row
+    %E      end of file
+
+The tables this script uses:
+
+    PROJECT   proj_id, proj_short_name, last_recalc_date (data date) ...
+    CALENDAR  clndr_id, clndr_name, day_hr_cnt (hours per working day)
+    PROJWBS   wbs_id, parent_wbs_id, wbs_short_name, wbs_name, proj_node_flag
+    TASK      activities. task_id is P6's internal key; task_code is the
+              Activity ID users see in P6.
+    TASKPRED  relationships. task_id is the successor, pred_task_id the
+              predecessor, both internal keys. pred_type is PR_FS/SS/FF/SF.
+
+Durations, float and lag are stored in hours. They are converted to working
+days using the activity's calendar (falling back to 8 hours/day).
+
+Usage
+-----
+    python xer_to_json.py schedule.xer               # writes p6_analysis.json
+    python xer_to_json.py schedule.xer -o out.json
+    python xer_to_json.py schedule.xer -o -          # JSON to stdout
+"""
+
+import argparse
 import json
 import os
+import sys
+from collections import defaultdict
 from datetime import datetime
 
-def parse_p6_xer(file_path: str) -> dict:
-    """
-    Parses a native Oracle Primavera P6 .xer file.
-    
-    IMPORTANT: .xer files are TAB-DELIMITED TEXT files, NOT XML.
-    This parser reads the file line-by-line, identifying sections by
-    the section header (e.g., [PROJECT], [ACTIVITY]) and splitting
-    subsequent lines by tabs to extract key-value pairs.
-    
-    Args:
-        file_path (str): The absolute or relative path to the .xer file.
-        
-    Returns:
-        dict: A JSON-serializable dictionary containing project metadata and activities.
-    """
-    if not os.path.exists(file_path):
-        return {"error": f"File not found: {file_path}"}
-    
-    project_data = {}
-    activities = []
-    wbs_map = {}
-    
-    # Track current section
-    current_section = None
-    # Track if we are in the data rows of a section
-    in_data = False
-    # Header fields for the current section
-    current_fields = []
-    
-    try:
-        # P6 XER files can be ASCII, ANSI, or UTF-8. 'latin-1' is a safe fallback 
-        # that rarely fails on binary-ish characters in these text files.
-        # 'utf-8-sig' handles BOM if present.
-        with open(file_path, 'r', encoding='utf-8-sig', errors='replace') as f:
-            lines = f.readlines()
-        
-        # P6 XER structure:
-        # Line 1: Header version info (e.g., "1")
-        # Line 2: Blank or comment
-        # Line 3: [SECTION_NAME]
-        # Line 4: Field1\tField2\tField3...
-        # Line N: Value1\tValue2\tValue3...
-        
-        i = 0
-        while i < len(lines):
-            line = lines[i].strip()
-            
-            # Skip empty lines or lines starting with '!' (comments)
-            if not line or line.startswith('!') or line.startswith('//'):
-                i += 1
-                continue
-                
-            # Check for Section Header (starts with [ and ends with ])
-            if line.startswith('[') and line.endswith(']'):
-                current_section = line[1:-1].upper()
-                in_data = False
-                current_fields = []
-                i += 1
-                
-                # Next line should be the field names
-                if i < len(lines):
-                    field_line = lines[i].strip()
-                    # The field line might be empty or contain tabs
-                    if field_line:
-                        current_fields = [f.strip() for f in field_line.split('\t')]
-                    in_data = True
-                    i += 1
-                continue
-            
-            # If we are in data mode and have fields, process the row
-            if in_data and current_fields and line:
-                values = line.split('\t')
-                # Create a dictionary for this row
-                row_data = {}
-                for idx, field in enumerate(current_fields):
-                    if idx < len(values):
-                        # Handle empty values
-                        val = values[idx].strip()
-                        row_data[field] = val if val else None
-                    else:
-                        row_data[field] = None
-                
-                # Process based on section
-                if current_section == 'PROJECT':
-                    # Usually only one main project in a snapshot, or we merge
-                    if 'PROJECT_ID' in row_data:
-                        project_data[row_data['PROJECT_ID']] = row_data
-                        # Also store a reference to the primary project
-                        if 'primary_project' not in project_data:
-                            project_data['primary_project'] = row_data['PROJECT_ID']
-                            
-                elif current_section == 'WBS':
-                    wbs_id = row_data.get('WBS_ID')
-                    wbs_name = row_data.get('WBS_NAME', 'Unknown')
-                    if wbs_id:
-                        wbs_map[wbs_id] = wbs_name
-                        
-                elif current_section == 'ACTIVITY':
-                    # Build the activity object
-                    act = {
-                        'id': row_data.get('ACTIVITY_ID'),
-                        'code': row_data.get('ACTIVITY_CODE'),
-                        'name': row_data.get('ACTIVITY_NAME'),
-                        'wbs_id': row_data.get('WBS_ID'),
-                        'status': row_data.get('STATUS'),
-                        'pct_complete': float(row_data.get('COMPLETE_PCT', 0) or 0),
-                        'duration': float(row_data.get('DURATION', 0) or 0),
-                        'early_start': row_data.get('EARLY_START_DATE'),
-                        'early_finish': row_data.get('EARLY_FINISH_DATE'),
-                        'late_start': row_data.get('LATE_START_DATE'),
-                        'late_finish': row_data.get('LATE_FINISH_DATE'),
-                        'total_float': float(row_data.get('TOTAL_FLOAT', 0) or 0),
-                        'free_float': float(row_data.get('FREE_FLOAT', 0) or 0),
-                        'is_critical': row_data.get('IS_CRITICAL') == '1',
-                        'baseline_finish': row_data.get('BASELINE_FINISH_DATE'),
-                        'p20_finish': row_data.get('P20_FINISH_DATE'),
-                        'p50_finish': row_data.get('P50_FINISH_DATE'),
-                        'p80_finish': row_data.get('P80_FINISH_DATE')
-                    }
-                    
-                    # Resolve WBS Name
-                    act['wbs_name'] = wbs_map.get(act['wbs_id'], 'Unknown')
-                    
-                    # Store activity ID for predecessor lookup later
-                    activities.append(act)
-                
-                # Move to next line
-                i += 1
-                continue
-            
-            # If line doesn't fit the above logic, skip it
-            i += 1
-            
-    except Exception as e:
-        return {"error": f"Error parsing XER file: {str(e)}"}
+DEFAULT_HOURS_PER_DAY = 8.0
 
-    # Second pass: Add predecessors to activities
-    # P6 stores predecessors in a separate [PREDECESSOR] section
-    # We need to re-scan or handle it in the first pass. 
-    # Let's refine the first pass to capture predecessors if the section exists.
-    
-    # NOTE: The above loop skips [PREDECESSOR] section data. 
-    # We need to modify the loop to capture PREDECESSOR sections.
-    # Let's restart with a more robust 2-pass approach or modify the section handler.
-    
-    # --- RE-IMPLEMENTATION WITH PREDECESSOR SUPPORT ---
-    # Let's do it properly. I will rewrite the parser to handle predecessors correctly.
-    
-    return {
-        "project": project_data,
-        "activities": activities,
-        "metadata": {
-            "parsed_at": datetime.now().isoformat(),
-            "activity_count": len(activities),
-            "source_file": os.path.basename(file_path),
-            "warning": "Predecessors not yet linked in this version. See note."
-        }
+STATUS_MAP = {
+    "TK_NotStart": "not_started",
+    "TK_Active": "in_progress",
+    "TK_Complete": "complete",
+}
+
+TASK_TYPE_MAP = {
+    "TT_Task": "task_dependent",
+    "TT_Rsrc": "resource_dependent",
+    "TT_Mile": "start_milestone",
+    "TT_FinMile": "finish_milestone",
+    "TT_LOE": "level_of_effort",
+    "TT_WBS": "wbs_summary",
+}
+
+RELATION_MAP = {"PR_FS": "FS", "PR_SS": "SS", "PR_FF": "FF", "PR_SF": "SF"}
+
+
+class XerError(Exception):
+    pass
+
+
+# --------------------------------------------------------------------------
+# Low-level reading
+# --------------------------------------------------------------------------
+
+def read_xer_text(file_path):
+    """XER exports are usually Windows-1252, sometimes UTF-8. Try UTF-8 first."""
+    with open(file_path, "rb") as f:
+        raw = f.read()
+    for enc in ("utf-8-sig", "cp1252"):
+        try:
+            return raw.decode(enc)
+        except UnicodeDecodeError:
+            continue
+    return raw.decode("latin-1")  # never fails
+
+
+def read_tables(text):
+    """Return {table_name: [row_dict, ...]} and the ERMHDR fields."""
+    tables = defaultdict(list)
+    header = []
+    current = None
+    fields = []
+
+    for lineno, line in enumerate(text.splitlines(), start=1):
+        if not line.strip():
+            continue
+        # Don't strip the whole line: trailing tabs are empty fields.
+        parts = line.rstrip("\r\n").split("\t")
+        marker = parts[0]
+
+        if marker == "ERMHDR":
+            header = parts[1:]
+        elif marker == "%T":
+            current = parts[1].strip() if len(parts) > 1 else None
+            fields = []
+            if current:
+                tables.setdefault(current, [])
+        elif marker == "%F":
+            fields = [p.strip() for p in parts[1:]]
+        elif marker == "%R":
+            if not current or not fields:
+                raise XerError(f"Line {lineno}: data row before table/field definition")
+            values = parts[1:]
+            row = {}
+            for i, name in enumerate(fields):
+                val = values[i] if i < len(values) else ""
+                row[name] = val if val != "" else None
+            tables[current].append(row)
+        elif marker == "%E":
+            break
+        # anything else is ignored
+
+    if not header and not tables:
+        raise XerError("No ERMHDR line or %T tables found - this doesn't look like an XER file")
+    return dict(tables), header
+
+
+# --------------------------------------------------------------------------
+# Value helpers
+# --------------------------------------------------------------------------
+
+def to_float(val):
+    if val is None:
+        return None
+    try:
+        return float(val)
+    except ValueError:
+        return None
+
+
+def to_iso(val):
+    """P6 writes dates as 'YYYY-MM-DD HH:MM'. Return ISO 8601, or None."""
+    if not val:
+        return None
+    for fmt in ("%Y-%m-%d %H:%M", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(val, fmt).isoformat(timespec="minutes")
+        except ValueError:
+            continue
+    return val  # leave unrecognised formats as they are
+
+
+def hours_to_days(hours, hours_per_day):
+    if hours is None:
+        return None
+    return round(hours / hours_per_day, 2)
+
+
+# --------------------------------------------------------------------------
+# Main conversion
+# --------------------------------------------------------------------------
+
+def parse_xer_file(file_path):
+    """Parse an XER file. Returns a dict; raises XerError or OSError on failure."""
+    if not os.path.exists(file_path):
+        raise XerError(f"File not found: {file_path}")
+
+    tables, header = read_tables(read_xer_text(file_path))
+    warnings = []
+
+    for required in ("PROJECT", "TASK"):
+        if required not in tables:
+            raise XerError(f"No {required} table in file")
+    for optional in ("PROJWBS", "TASKPRED", "CALENDAR"):
+        if optional not in tables:
+            warnings.append(f"No {optional} table in file")
+
+    # Calendars: hours per working day
+    cal_hours = {}
+    for c in tables.get("CALENDAR", []):
+        hpd = to_float(c.get("day_hr_cnt"))
+        cal_hours[c.get("clndr_id")] = hpd if hpd and hpd > 0 else DEFAULT_HOURS_PER_DAY
+
+    # WBS: names and full path (excluding the project node itself)
+    wbs = {w["wbs_id"]: w for w in tables.get("PROJWBS", []) if w.get("wbs_id")}
+
+    def wbs_path(wbs_id):
+        names, seen = [], set()
+        while wbs_id in wbs and wbs_id not in seen:
+            seen.add(wbs_id)
+            node = wbs[wbs_id]
+            if node.get("proj_node_flag") == "Y":
+                break
+            names.append(node.get("wbs_name") or node.get("wbs_short_name") or "")
+            wbs_id = node.get("parent_wbs_id")
+        return " / ".join(reversed(names)) or None
+
+    # Project name lives on the project's root WBS node, not in PROJECT
+    project_names = {
+        w.get("proj_id"): w.get("wbs_name")
+        for w in wbs.values() if w.get("proj_node_flag") == "Y"
     }
 
-# --- CORRECTED FULL IMPLEMENTATION WITH PREDECESSORS ---
+    projects = []
+    proj_short = {}
+    for p in tables["PROJECT"]:
+        pid = p.get("proj_id")
+        proj_short[pid] = p.get("proj_short_name")
+        projects.append({
+            "proj_id": pid,
+            "short_name": p.get("proj_short_name"),
+            "name": project_names.get(pid),
+            "data_date": to_iso(p.get("last_recalc_date")),
+            "planned_start": to_iso(p.get("plan_start_date")),
+            "must_finish_by": to_iso(p.get("plan_end_date")),
+            "scheduled_finish": to_iso(p.get("scd_end_date")),
+        })
 
-def parse_p6_xer_complete(file_path: str) -> dict:
-    """
-    Robust parser for native P6 .xer files (Tab-Delimited).
-    Handles PROJECT, WBS, ACTIVITY, and PREDECESSOR sections.
-    """
-    if not os.path.exists(file_path):
-        return {"error": f"File not found: {file_path}"}
-        
-    project_data = {}
-    activities_dict = {} # Store by ID to link predecessors later
-    wbs_map = {}
-    predecessors_list = []
-    
-    current_section = None
-    current_fields = []
-    in_data = False
-    
-    try:
-        with open(file_path, 'r', encoding='utf-8-sig', errors='replace') as f:
-            lines = f.readlines()
-        
-        i = 0
-        while i < len(lines):
-            line = lines[i].strip()
-            
-            # Skip comments/empties
-            if not line or line.startswith('!') or line.startswith('//'):
-                i += 1
-                continue
-                
-            # Section Header
-            if line.startswith('[') and line.endswith(']'):
-                current_section = line[1:-1].upper()
-                in_data = False
-                current_fields = []
-                i += 1
-                
-                if i < len(lines):
-                    field_line = lines[i].strip()
-                    if field_line:
-                        current_fields = [f.strip() for f in field_line.split('\t')]
-                    in_data = True
-                    i += 1
-                continue
-            
-            # Data Row
-            if in_data and current_fields and line:
-                values = line.split('\t')
-                row_data = {}
-                for idx, field in enumerate(current_fields):
-                    val = values[idx].strip() if idx < len(values) else None
-                    row_data[field] = val if val else None
-                
-                if current_section == 'PROJECT':
-                    proj_id = row_data.get('PROJECT_ID')
-                    if proj_id:
-                        project_data[proj_id] = row_data
-                        
-                elif current_section == 'WBS':
-                    wbs_id = row_data.get('WBS_ID')
-                    if wbs_id:
-                        wbs_map[wbs_id] = row_data.get('WBS_NAME', 'Unknown')
-                        
-                elif current_section == 'ACTIVITY':
-                    act_id = row_data.get('ACTIVITY_ID')
-                    if act_id:
-                        activities_dict[act_id] = {
-                            'id': act_id,
-                            'code': row_data.get('ACTIVITY_CODE'),
-                            'name': row_data.get('ACTIVITY_NAME'),
-                            'wbs_id': row_data.get('WBS_ID'),
-                            'status': row_data.get('STATUS'),
-                            'pct_complete': float(row_data.get('COMPLETE_PCT', 0) or 0),
-                            'duration': float(row_data.get('DURATION', 0) or 0),
-                            'early_start': row_data.get('EARLY_START_DATE'),
-                            'early_finish': row_data.get('EARLY_FINISH_DATE'),
-                            'late_start': row_data.get('LATE_START_DATE'),
-                            'late_finish': row_data.get('LATE_FINISH_DATE'),
-                            'total_float': float(row_data.get('TOTAL_FLOAT', 0) or 0),
-                            'free_float': float(row_data.get('FREE_FLOAT', 0) or 0),
-                            'is_critical': row_data.get('IS_CRITICAL') == '1',
-                            'baseline_finish': row_data.get('BASELINE_FINISH_DATE'),
-                            'p20_finish': row_data.get('P20_FINISH_DATE'),
-                            'p50_finish': row_data.get('P50_FINISH_DATE'),
-                            'p80_finish': row_data.get('P80_FINISH_DATE'),
-                            'predecessors': [] # List to be populated later
-                        }
-                        
-                elif current_section == 'PREDECESSOR':
-                    # P6 Pred Structure: ACTIVITY_ID (Successor) and SUCCESSOR_ID or PREDECESSOR_ID?
-                    # Typically: ACTIVITY_ID is the Successor, and the other ID is the Predecessor.
-                    # Fields vary by version, commonly: 'ACTIVITY_ID', 'SUCCESSOR_ID' or 'PREDECESSOR_ID'
-                    # Let's look for 'ACTIVITY_ID' (Successor) and 'PREDECESSOR_ID' or 'SUCCESSOR_ID'
-                    succ_id = row_data.get('ACTIVITY_ID')
-                    pred_id = row_data.get('PREDECESSOR_ID') or row_data.get('SUCCESSOR_ID') 
-                    # Note: Some exports name the fields differently. 
-                    # Common fields: ACTIVITY_ID, SUCCESSOR_ID, RELATION_TYPE, LAG
-                    # If 'PREDECESSOR_ID' is not present, check 'SUCCESSOR_ID' might be the link to previous.
-                    # Actually, in P6 XER, the [PREDECESSOR] section usually lists:
-                    # ACTIVITY_ID (The activity that HAS the predecessor)
-                    # SUCCESSOR_ID (This is confusingly named, often holds the PREDECESSOR activity ID in some versions)
-                    # Let's assume:
-                    # Field 'ACTIVITY_ID' = The activity being defined (Successor)
-                    # Field 'SUCCESSOR_ID' or 'PREDECESSOR_ID' = The ID of the task it depends on.
-                    
-                    # Let's check common P6 XER predecessor fields:
-                    # ACTIVITY_ID, SUCCESSOR_ID (often this is actually the predecessor ID in raw dumps), RELATION_TYPE, LAG
-                    # To be safe, we look for a field that isn't the main activity ID.
-                    # Let's try both common keys.
-                    pred_ref = row_data.get('PREDECESSOR_ID') or row_data.get('SUCCESSOR_ID')
-                    
-                    if succ_id and pred_ref:
-                        # Ensure the successor activity exists in our dict
-                        if succ_id in activities_dict:
-                            activities_dict[succ_id]['predecessors'].append({
-                                'id': pred_ref,
-                                'type': row_data.get('RELATION_TYPE', 'FS'),
-                                'lag': float(row_data.get('LAG', 0) or 0)
-                            })
-                
-                i += 1
-                continue
-                
-            i += 1
-            
-    except Exception as e:
-        return {"error": f"Error parsing XER file: {str(e)}"}
-        
-    # Finalize activities list
-    activities_list = list(activities_dict.values())
-    for act in activities_list:
-        act['wbs_name'] = wbs_map.get(act['wbs_id'], 'Unknown')
-        
-    return {
-        "project": project_data,
-        "activities": activities_list,
-        "metadata": {
-            "parsed_at": datetime.now().isoformat(),
-            "activity_count": len(activities_list),
-            "source_file": os.path.basename(file_path),
-            "format": "P6 Native XER (Tab-Delimited)"
+    # Activities
+    activities = {}
+    for t in tables["TASK"]:
+        tid = t.get("task_id")
+        if not tid:
+            continue
+        hpd = cal_hours.get(t.get("clndr_id"), DEFAULT_HOURS_PER_DAY)
+        total_float = hours_to_days(to_float(t.get("total_float_hr_cnt")), hpd)
+        status = STATUS_MAP.get(t.get("status_code"), t.get("status_code"))
+        activities[tid] = {
+            "id": t.get("task_code"),
+            "name": t.get("task_name"),
+            "project": proj_short.get(t.get("proj_id")),
+            "wbs_id": t.get("wbs_id"),
+            "wbs_name": wbs.get(t.get("wbs_id"), {}).get("wbs_name"),
+            "wbs_path": wbs_path(t.get("wbs_id")),
+            "type": TASK_TYPE_MAP.get(t.get("task_type"), t.get("task_type")),
+            "status": status,
+            "pct_complete": to_float(t.get("phys_complete_pct")) or 0.0,
+            "calendar": t.get("clndr_id"),
+            "original_duration": hours_to_days(to_float(t.get("target_drtn_hr_cnt")), hpd),
+            "remaining_duration": hours_to_days(to_float(t.get("remain_drtn_hr_cnt")), hpd),
+            "actual_start": to_iso(t.get("act_start_date")),
+            "actual_finish": to_iso(t.get("act_end_date")),
+            "early_start": to_iso(t.get("early_start_date")),
+            "early_finish": to_iso(t.get("early_end_date")),
+            "late_start": to_iso(t.get("late_start_date")),
+            "late_finish": to_iso(t.get("late_end_date")),
+            "planned_start": to_iso(t.get("target_start_date")),
+            "planned_finish": to_iso(t.get("target_end_date")),
+            "constraint": t.get("cstr_type"),
+            "constraint_date": to_iso(t.get("cstr_date")),
+            "total_float": total_float,
+            "free_float": hours_to_days(to_float(t.get("free_float_hr_cnt")), hpd),
+            # P6's default definition: total float <= 0 on an unfinished activity
+            "is_critical": status != "complete" and total_float is not None and total_float <= 0,
+            "on_longest_path": t.get("driving_path_flag") == "Y",
+            "predecessors": [],
+            "successors": [],
         }
+
+    # Relationships
+    unresolved = 0
+    for r in tables.get("TASKPRED", []):
+        succ, pred = activities.get(r.get("task_id")), activities.get(r.get("pred_task_id"))
+        if succ is None and pred is None:
+            unresolved += 1
+            continue
+        # P6 measures lag on the successor's calendar by default
+        hpd = cal_hours.get((succ or pred)["calendar"], DEFAULT_HOURS_PER_DAY)
+        rel = RELATION_MAP.get(r.get("pred_type"), r.get("pred_type"))
+        lag = hours_to_days(to_float(r.get("lag_hr_cnt")), hpd) or 0.0
+        pred_code = pred["id"] if pred else f"external:{r.get('pred_task_id')}"
+        succ_code = succ["id"] if succ else f"external:{r.get('task_id')}"
+        if pred is None or succ is None:
+            unresolved += 1
+        if succ is not None:
+            succ["predecessors"].append({"id": pred_code, "type": rel, "lag": lag})
+        if pred is not None:
+            pred["successors"].append({"id": succ_code, "type": rel, "lag": lag})
+    if unresolved:
+        warnings.append(f"{unresolved} relationship(s) point to activities not in this file")
+
+    activity_list = list(activities.values())
+    for a in activity_list:
+        a.pop("calendar")
+
+    return {
+        "projects": projects,
+        "activities": activity_list,
+        "metadata": {
+            "parsed_at": datetime.now().isoformat(timespec="seconds"),
+            "source_file": os.path.basename(file_path),
+            "p6_version": header[0] if header else None,
+            "export_date": header[1] if len(header) > 1 else None,
+            "activity_count": len(activity_list),
+            "relationship_count": len(tables.get("TASKPRED", [])),
+            "units": "durations, float and lag in working days",
+            "warnings": warnings,
+        },
     }
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description="Convert a Primavera P6 .xer file to JSON.")
+    ap.add_argument("xer_file")
+    ap.add_argument("-o", "--output", default="p6_analysis.json",
+                    help="output path, or - for stdout (default: p6_analysis.json)")
+    args = ap.parse_args(argv)
+
+    try:
+        result = parse_xer_file(args.xer_file)
+    except (XerError, OSError) as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 1
+
+    text = json.dumps(result, indent=2, ensure_ascii=False)
+    if args.output == "-":
+        print(text)
+    else:
+        with open(args.output, "w", encoding="utf-8") as f:
+            f.write(text)
+        meta = result["metadata"]
+        names = ", ".join(p["name"] or p["short_name"] or "?" for p in result["projects"])
+        print(f"Parsed {meta['activity_count']} activities and "
+              f"{meta['relationship_count']} relationships from {names}", file=sys.stderr)
+        for w in meta["warnings"]:
+            print(f"Warning: {w}", file=sys.stderr)
+        print(f"JSON saved to {args.output}", file=sys.stderr)
+    return 0
+
 
 if __name__ == "__main__":
-    import sys
-    if len(sys.argv) < 2:
-        print("Usage: python xer_to_json.py <path_to_xer_file>")
-        sys.exit(1)
-        
-    file_path = sys.argv[1]
-    result = parse_p6_xer_complete(file_path)
-    
-    if "error" in result:
-        print(f"Error: {result['error']}")
-    else:
-        print(f"Successfully parsed {result['metadata']['activity_count']} activities.")
-        primary_proj = result['project'].get('primary_project') if 'primary_project' in result['project'] else list(result['project'].keys())[0] if result['project'] else 'Unknown'
-        if primary_proj in result['project']:
-            print(f"Project: {result['project'][primary_proj].get('PROJECT_NAME', 'Unknown')}")
-            
-        output_file = "p6_analysis.json"
-        with open(output_file, 'w', encoding='utf-8') as f:
-            json.dump(result, f, indent=2, ensure_ascii=False)
-        print(f"JSON saved to {output_file}")
+    sys.exit(main())

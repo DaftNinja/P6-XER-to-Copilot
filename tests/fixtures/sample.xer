@@ -1,0 +1,27 @@
+ERMHDR	19.12	2026-11-08	Project	admin	Admin User	dbxDatabaseNoName	Project Management	GBP
+%T	CALENDAR
+%F	clndr_id	default_flag	clndr_name	day_hr_cnt
+%R	1	Y	Standard 5 Day	8
+%R	2	N	24/7 Commissioning	24
+%T	PROJECT
+%F	proj_id	proj_short_name	last_recalc_date	plan_start_date	plan_end_date	scd_end_date
+%R	101	LON-DC1	2026-11-02 08:00	2026-01-05 08:00		2026-12-18 17:00
+%T	PROJWBS
+%F	wbs_id	proj_id	parent_wbs_id	proj_node_flag	wbs_short_name	wbs_name
+%R	200	101		Y	LON-DC1	London DC1 – Hall 2 fit-out
+%R	201	101	200	N	EL	Electrical
+%R	202	101	201	N	HV	HV switchgear
+%R	203	101	200	N	CX	Commissioning
+%T	TASK
+%F	task_id	proj_id	wbs_id	clndr_id	task_code	task_name	task_type	status_code	phys_complete_pct	target_drtn_hr_cnt	remain_drtn_hr_cnt	total_float_hr_cnt	free_float_hr_cnt	driving_path_flag	act_start_date	act_end_date	early_start_date	early_end_date	late_start_date	late_end_date	target_start_date	target_end_date	cstr_type	cstr_date
+%R	301	101	202	1	A1000	Install HV switchgear	TT_Task	TK_Complete	100	80	0			N	2026-09-01 08:00	2026-09-12 17:00					2026-09-01 08:00	2026-09-12 17:00		
+%R	302	101	202	1	A1010	Energise HV switchgear	TT_Task	TK_Active	40	40	24	0	0	Y	2026-10-28 08:00		2026-11-02 08:00	2026-11-04 17:00	2026-11-02 08:00	2026-11-04 17:00	2026-10-28 08:00	2026-11-03 17:00		
+%R	303	101	203	2	A2000	IST – Level 5	TT_Task	TK_NotStart	0	72	72	-24	0	Y			2026-11-05 08:00	2026-11-07 23:00	2026-11-04 08:00	2026-11-06 23:00	2026-11-04 08:00	2026-11-06 23:00		
+%R	304	101	203	1	M9000	Hall 2 ready for service	TT_FinMile	TK_NotStart	0	0	0	40	40	N				2026-11-09 17:00		2026-11-16 17:00		2026-11-13 17:00	CS_MEOB	2026-11-16 17:00
+%T	TASKPRED
+%F	task_pred_id	task_id	pred_task_id	proj_id	pred_proj_id	pred_type	lag_hr_cnt
+%R	401	302	301	101	101	PR_FS	0
+%R	402	303	302	101	101	PR_SS	48
+%R	403	304	303	101	101	PR_FF	0
+%R	404	303	999	101	102	PR_FS	0
+%E
